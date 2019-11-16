@@ -1,28 +1,36 @@
-import os
-import json
-import time
-import inspect
-import pickle
 import colorsys
+import inspect
+import json
+import os
+import pickle
+import shutil
+import time
 from pathlib import Path
-from utils import Path_utils
-from utils import std_utils
-from utils import image_utils
-from utils.cv2_utils import *
-import numpy as np
+
 import cv2
-from samples import SampleGeneratorBase
-from nnlib import nnlib
+import numpy as np
+
+import imagelib
 from interact import interact as io
+from nnlib import nnlib
+from samplelib import SampleGeneratorBase
+from utils import Path_utils, std_utils
+from utils.cv2_utils import *
+
 '''
 You can implement your own model. Check examples.
 '''
 class ModelBase(object):
 
 
-    def __init__(self, model_path, training_data_src_path=None, training_data_dst_path=None, debug = False, device_args = None,
-                 ask_write_preview_history=True, ask_target_iter=True, ask_batch_size=True, ask_sort_by_yaw=True,
-                 ask_random_flip=True, ask_src_scale_mod=True):
+    def __init__(self, model_path, training_data_src_path=None, training_data_dst_path=None, pretraining_data_path=None, is_training=False, debug = False, device_args = None,
+                 ask_enable_autobackup=True,
+                 ask_write_preview_history=True,
+                 ask_target_iter=True,
+                 ask_batch_size=True,
+                 ask_sort_by_yaw=True,
+                 ask_random_flip=True,
+                 ask_src_scale_mod=True):
 
         device_args['force_gpu_idx'] = device_args.get('force_gpu_idx',-1)
         device_args['cpu_only'] = device_args.get('cpu_only',False)
@@ -37,7 +45,7 @@ class ModelBase(object):
                 device_args['force_gpu_idx'] = io.input_int("Which GPU idx to choose? ( skip: best GPU ) : ", -1, [ x[0] for x in idxs_names_list] )
         self.device_args = device_args
 
-        self.device_config = nnlib.DeviceConfig(allow_growth=False, **self.device_args)
+        self.device_config = nnlib.DeviceConfig(allow_growth=True, **self.device_args)
 
         io.log_info ("Loading model...")
 
@@ -46,15 +54,10 @@ class ModelBase(object):
 
         self.training_data_src_path = training_data_src_path
         self.training_data_dst_path = training_data_dst_path
+        self.pretraining_data_path = pretraining_data_path
 
-        self.src_images_paths = None
-        self.dst_images_paths = None
-        self.src_yaw_images_paths = None
-        self.dst_yaw_images_paths = None
-        self.src_data_generator = None
-        self.dst_data_generator = None
         self.debug = debug
-        self.is_training_mode = (training_data_src_path is not None and training_data_dst_path is not None)
+        self.is_training_mode = is_training
 
         self.iter = 0
         self.options = {}
@@ -69,15 +72,21 @@ class ModelBase(object):
                 self.options.pop('epoch')
             if self.iter != 0:
                 self.options = model_data['options']
-                self.loss_history = model_data['loss_history'] if 'loss_history' in model_data.keys() else []
-                self.sample_for_preview = model_data['sample_for_preview']  if 'sample_for_preview' in model_data.keys() else None
+                self.loss_history = model_data.get('loss_history', [])
+                self.sample_for_preview = model_data.get('sample_for_preview', None)
 
-        ask_override = self.is_training_mode and self.iter != 0 and io.input_in_time ("Press enter in 2 seconds to override model settings.", 2)
+        ask_override = self.is_training_mode and self.iter != 0 and io.input_in_time ("Press enter in 2 seconds to override model settings.", 5 if io.is_colab() else 2 )
 
         yn_str = {True:'y',False:'n'}
 
         if self.iter == 0:
-            io.log_info ("\nModel first run. Enter model options as default for each run.")
+            io.log_info ("\nModel first run.")
+
+        if ask_enable_autobackup and (self.iter == 0 or ask_override):
+            default_autobackup = False if self.iter == 0 else self.options.get('autobackup',False)
+            self.options['autobackup'] = io.input_bool("Enable autobackup? (y/n ?:help skip:%s) : " % (yn_str[default_autobackup]) , default_autobackup, help_message="Autobackup model files with preview every hour for last 15 hours. Latest backup located in model/<>_autobackups/01")
+        else:
+            self.options['autobackup'] = self.options.get('autobackup', False)
 
         if ask_write_preview_history and (self.iter == 0 or ask_override):
             default_write_preview_history = False if self.iter == 0 else self.options.get('write_preview_history',False)
@@ -85,48 +94,65 @@ class ModelBase(object):
         else:
             self.options['write_preview_history'] = self.options.get('write_preview_history', False)
 
-        if ask_target_iter and (self.iter == 0 or ask_override):
-            self.options['target_iter'] = max(0, io.input_int("Target iteration (skip:unlimited/default) : ", 0))
+        if (self.iter == 0 or ask_override) and self.options['write_preview_history'] and io.is_support_windows():
+            choose_preview_history = io.input_bool("Choose image for the preview history? (y/n skip:%s) : " % (yn_str[False]) , False)
+        elif (self.iter == 0 or ask_override) and self.options['write_preview_history'] and io.is_colab():
+            choose_preview_history = io.input_bool("Randomly choose new image for preview history? (y/n ?:help skip:%s) : " % (yn_str[False]), False, help_message="Preview image history will stay stuck with old faces if you reuse the same model on different celebs. Choose no unless you are changing src/dst to a new person")
         else:
-            self.options['target_iter'] = max(model_data.get('target_iter',0), self.options.get('target_epoch',0))
-            if 'target_epoch' in self.options:
-                self.options.pop('target_epoch')
+            choose_preview_history = False
+
+        if ask_target_iter:
+            if (self.iter == 0 or ask_override):
+                self.options['target_iter'] = max(0, io.input_int("Target iteration (skip:unlimited/default) : ", 0))
+            else:
+                self.options['target_iter'] = max(model_data.get('target_iter',0), self.options.get('target_epoch',0))
+                if 'target_epoch' in self.options:
+                    self.options.pop('target_epoch')
 
         if ask_batch_size and (self.iter == 0 or ask_override):
             default_batch_size = 0 if self.iter == 0 else self.options.get('batch_size',0)
-            self.options['batch_size'] = max(0, io.input_int("Batch_size (?:help skip:%d) : " % (default_batch_size), default_batch_size, help_message="Larger batch size is always better for NN's generalization, but it can cause Out of Memory error. Tune this value for your videocard manually."))
+            self.batch_size = max(0, io.input_int("Batch_size (?:help skip:%d) : " % (default_batch_size), default_batch_size, help_message="Larger batch size is better for NN's generalization, but it can cause Out of Memory error. Tune this value for your videocard manually."))
         else:
-            self.options['batch_size'] = self.options.get('batch_size', 0)
+            self.batch_size = self.options.get('batch_size', 0)
 
-        if ask_sort_by_yaw and (self.iter == 0):
-            self.options['sort_by_yaw'] = io.input_bool("Feed faces to network sorted by yaw? (y/n ?:help skip:n) : ", False, help_message="NN will not learn src face directions that don't match dst face directions." )
-        else:
-            self.options['sort_by_yaw'] = self.options.get('sort_by_yaw', False)
+        if ask_sort_by_yaw:
+            if (self.iter == 0 or ask_override):
+                default_sort_by_yaw = self.options.get('sort_by_yaw', False)
+                self.options['sort_by_yaw'] = io.input_bool("Feed faces to network sorted by yaw? (y/n ?:help skip:%s) : " % (yn_str[default_sort_by_yaw]), default_sort_by_yaw, help_message="NN will not learn src face directions that don't match dst face directions. Do not use if the dst face has hair that covers the jaw." )
+            else:
+                self.options['sort_by_yaw'] = self.options.get('sort_by_yaw', False)
 
-        if ask_random_flip and (self.iter == 0):
-            self.options['random_flip'] = io.input_bool("Flip faces randomly? (y/n ?:help skip:y) : ", True, help_message="Predicted face will look more naturally without this option, but src faceset should cover all face directions as dst faceset.")
-        else:
-            self.options['random_flip'] = self.options.get('random_flip', True)
+        if ask_random_flip:
+            default_random_flip = self.options.get('random_flip', True)
+            if (self.iter == 0 or ask_override):
+                self.options['random_flip'] = io.input_bool(f"Flip faces randomly? (y/n ?:help skip:{yn_str[default_random_flip]}) : ", default_random_flip, help_message="Predicted face will look more naturally without this option, but src faceset should cover all face directions as dst faceset.")
+            else:
+                self.options['random_flip'] = self.options.get('random_flip', default_random_flip)
 
-        if ask_src_scale_mod and (self.iter == 0):
-            self.options['src_scale_mod'] = np.clip( io.input_int("Src face scale modifier % ( -30...30, ?:help skip:0) : ", 0, help_message="If src face shape is wider than dst, try to decrease this value to get a better result."), -30, 30)
-        else:
-            self.options['src_scale_mod'] = self.options.get('src_scale_mod', 0)
+        if ask_src_scale_mod:
+            if (self.iter == 0):
+                self.options['src_scale_mod'] = np.clip( io.input_int("Src face scale modifier % ( -30...30, ?:help skip:0) : ", 0, help_message="If src face shape is wider than dst, try to decrease this value to get a better result."), -30, 30)
+            else:
+                self.options['src_scale_mod'] = self.options.get('src_scale_mod', 0)
 
-        self.write_preview_history = self.options['write_preview_history']
-        if not self.options['write_preview_history']:
+        self.autobackup = self.options.get('autobackup', False)
+        if not self.autobackup and 'autobackup' in self.options:
+            self.options.pop('autobackup')
+
+        self.write_preview_history = self.options.get('write_preview_history', False)
+        if not self.write_preview_history and 'write_preview_history' in self.options:
             self.options.pop('write_preview_history')
 
-        self.target_iter = self.options['target_iter']
-        if self.options['target_iter'] == 0:
+        self.target_iter = self.options.get('target_iter',0)
+        if self.target_iter == 0 and 'target_iter' in self.options:
             self.options.pop('target_iter')
 
-        self.batch_size = self.options['batch_size']
-        self.sort_by_yaw = self.options['sort_by_yaw']
-        self.random_flip = self.options['random_flip']
+        #self.batch_size = self.options.get('batch_size',0)
+        self.sort_by_yaw = self.options.get('sort_by_yaw',False)
+        self.random_flip = self.options.get('random_flip',True)
 
-        self.src_scale_mod = self.options['src_scale_mod']
-        if self.src_scale_mod == 0:
+        self.src_scale_mod = self.options.get('src_scale_mod',0)
+        if self.src_scale_mod == 0 and 'src_scale_mod' in self.options:
             self.options.pop('src_scale_mod')
 
         self.onInitializeOptions(self.iter == 0, ask_override)
@@ -143,12 +169,20 @@ class ModelBase(object):
             self.batch_size = 1
 
         if self.is_training_mode:
-            if self.write_preview_history:
-                if self.device_args['force_gpu_idx'] == -1:
-                    self.preview_history_path = self.model_path / ( '%s_history' % (self.get_model_name()) )
-                else:
-                    self.preview_history_path = self.model_path / ( '%d_%s_history' % (self.device_args['force_gpu_idx'], self.get_model_name()) )
+            if self.device_args['force_gpu_idx'] == -1:
+                self.preview_history_path = self.model_path / ( '%s_history' % (self.get_model_name()) )
+                self.autobackups_path = self.model_path / ( '%s_autobackups' % (self.get_model_name()) )
+            else:
+                self.preview_history_path = self.model_path / ( '%d_%s_history' % (self.device_args['force_gpu_idx'], self.get_model_name()) )
+                self.autobackups_path = self.model_path / ( '%d_%s_autobackups' % (self.device_args['force_gpu_idx'], self.get_model_name()) )
 
+            if self.autobackup:
+                self.autobackup_current_hour = time.localtime().tm_hour
+
+                if not self.autobackups_path.exists():
+                    self.autobackups_path.mkdir(exist_ok=True)
+
+            if self.write_preview_history or io.is_colab():
                 if not self.preview_history_path.exists():
                     self.preview_history_path.mkdir(exist_ok=True)
                 else:
@@ -163,39 +197,90 @@ class ModelBase(object):
                     if not isinstance(generator, SampleGeneratorBase):
                         raise ValueError('training data generator is not subclass of SampleGeneratorBase')
 
-            if (self.sample_for_preview is None) or (self.iter == 0):
+            if self.sample_for_preview is None or choose_preview_history:
+                if choose_preview_history and io.is_support_windows():
+                    io.log_info ("Choose image for the preview history. [p] - next. [enter] - confirm.")
+                    wnd_name = "[p] - next. [enter] - confirm."
+                    io.named_window(wnd_name)
+                    io.capture_keys(wnd_name)
+                    choosed = False
+                    while not choosed:
+                        self.sample_for_preview = self.generate_next_sample()
+                        preview = self.get_static_preview()
+                        io.show_image( wnd_name, (preview*255).astype(np.uint8) )
+
+                        while True:
+                            key_events = io.get_key_events(wnd_name)
+                            key, chr_key, ctrl_pressed, alt_pressed, shift_pressed = key_events[-1] if len(key_events) > 0 else (0,0,False,False,False)
+                            if key == ord('\n') or key == ord('\r'):
+                                choosed = True
+                                break
+                            elif key == ord('p'):
+                                break
+
+                            try:
+                                io.process_messages(0.1)
+                            except KeyboardInterrupt:
+                                choosed = True
+
+                    io.destroy_window(wnd_name)
+                else:
+                    self.sample_for_preview = self.generate_next_sample()
+                    
+            try:
+                self.get_static_preview()
+            except:
                 self.sample_for_preview = self.generate_next_sample()
+                
+            self.last_sample = self.sample_for_preview
+            
+        ###Generate text summary of model hyperparameters
+        #Find the longest key name and value string. Used as column widths.
+        width_name = max([len(k) for k in self.options.keys()] + [17]) + 1 # Single space buffer to left edge. Minimum of 17, the length of the longest static string used "Current iteration"
+        width_value = max([len(str(x)) for x in self.options.values()] + [len(str(self.iter)), len(self.get_model_name())]) + 1 # Single space buffer to right edge
+        if not self.device_config.cpu_only: #Check length of GPU names
+            width_value = max([len(nnlib.device.getDeviceName(idx))+1 for idx in self.device_config.gpu_idxs] + [width_value])
+        width_total = width_name + width_value + 2 #Plus 2 for ": "
 
         model_summary_text = []
+        model_summary_text += [f'=={" Model Summary ":=^{width_total}}=='] # Model/status summary
+        model_summary_text += [f'=={" "*width_total}==']
+        model_summary_text += [f'=={"Model name": >{width_name}}: {self.get_model_name(): <{width_value}}=='] # Name
+        model_summary_text += [f'=={" "*width_total}==']
+        model_summary_text += [f'=={"Current iteration": >{width_name}}: {str(self.iter): <{width_value}}=='] # Iter
+        model_summary_text += [f'=={" "*width_total}==']
 
-        model_summary_text += ["===== Model summary ====="]
-        model_summary_text += ["== Model name: " + self.get_model_name()]
-        model_summary_text += ["=="]
-        model_summary_text += ["== Current iteration: " + str(self.iter)]
-        model_summary_text += ["=="]
-        model_summary_text += ["== Model options:"]
+        model_summary_text += [f'=={" Model Options ":-^{width_total}}=='] # Model options
+        model_summary_text += [f'=={" "*width_total}==']
         for key in self.options.keys():
-            model_summary_text += ["== |== %s : %s" % (key, self.options[key])]
+            model_summary_text += [f'=={key: >{width_name}}: {str(self.options[key]): <{width_value}}=='] # self.options key/value pairs
+        model_summary_text += [f'=={" "*width_total}==']
 
+        model_summary_text += [f'=={" Running On ":-^{width_total}}=='] # Training hardware info
+        model_summary_text += [f'=={" "*width_total}==']
         if self.device_config.multi_gpu:
-            model_summary_text += ["== |== multi_gpu : True "]
-
-        model_summary_text += ["== Running on:"]
+            model_summary_text += [f'=={"Using multi_gpu": >{width_name}}: {"True": <{width_value}}=='] # multi_gpu
+            model_summary_text += [f'=={" "*width_total}==']
         if self.device_config.cpu_only:
-            model_summary_text += ["== |== [CPU]"]
+            model_summary_text += [f'=={"Using device": >{width_name}}: {"CPU": <{width_value}}=='] # cpu_only
         else:
             for idx in self.device_config.gpu_idxs:
-                model_summary_text += ["== |== [%d : %s]" % (idx, nnlib.device.getDeviceName(idx))]
+                model_summary_text += [f'=={"Device index": >{width_name}}: {idx: <{width_value}}=='] # GPU hardware device index
+                model_summary_text += [f'=={"Name": >{width_name}}: {nnlib.device.getDeviceName(idx): <{width_value}}=='] # GPU name
+                vram_str = f'{nnlib.device.getDeviceVRAMTotalGb(idx):.2f}GB' # GPU VRAM - Formated as #.## (or ##.##)
+                model_summary_text += [f'=={"VRAM": >{width_name}}: {vram_str: <{width_value}}==']
+        model_summary_text += [f'=={" "*width_total}==']
+        model_summary_text += [f'=={"="*width_total}==']
 
-        if not self.device_config.cpu_only and self.device_config.gpu_vram_gb[0] == 2:
-            model_summary_text += ["=="]
-            model_summary_text += ["== WARNING: You are using 2GB GPU. Result quality may be significantly decreased."]
-            model_summary_text += ["== If training does not start, close all programs and try again."]
-            model_summary_text += ["== Also you can disable Windows Aero Desktop to get extra free VRAM."]
-            model_summary_text += ["=="]
+        if not self.device_config.cpu_only and self.device_config.gpu_vram_gb[0] <= 2: # Low VRAM warning
+            model_summary_text += ["/!\\"]
+            model_summary_text += ["/!\\ WARNING:"]
+            model_summary_text += ["/!\\ You are using a GPU with 2GB or less VRAM. This may significantly reduce the quality of your result!"]
+            model_summary_text += ["/!\\ If training does not start, close all programs and try again."]
+            model_summary_text += ["/!\\ Also you can disable Windows Aero Desktop to increase available VRAM."]
+            model_summary_text += ["/!\\"]
 
-        model_summary_text += ["========================="]
-        model_summary_text = "\r\n".join (model_summary_text)
+        model_summary_text = "\n".join (model_summary_text)
         self.model_summary_text = model_summary_text
         io.log_info(model_summary_text)
 
@@ -236,10 +321,14 @@ class ModelBase(object):
     def get_model_name(self):
         return Path(inspect.getmodule(self).__file__).parent.name.rsplit("_", 1)[1]
 
+    #overridable , return [ [model, filename],... ]  list
+    def get_model_filename_list(self):
+        return []
+
     #overridable
-    def get_converter(self):
-        raise NotImplementeError
-        #return existing or your own converter which derived from base
+    def get_ConverterConfig(self):
+        #return predictor_func, predictor_input_shape, ConverterConfig() for the model
+        raise NotImplementedError
 
     def get_target_iter(self):
         return self.target_iter
@@ -273,7 +362,8 @@ class ModelBase(object):
         return self.onGetPreview (self.sample_for_preview)[0][1] #first preview, and bgr
 
     def save(self):
-        Path( self.get_strpath_storage_for_file('summary.txt') ).write_text(self.model_summary_text)
+        summary_path = self.get_strpath_storage_for_file('summary.txt')
+        Path( summary_path ).write_text(self.model_summary_text)
         self.onSave()
 
         model_data = {
@@ -284,36 +374,105 @@ class ModelBase(object):
         }
         self.model_data_path.write_bytes( pickle.dumps(model_data) )
 
+        bckp_filename_list = [ self.get_strpath_storage_for_file(filename) for _, filename in self.get_model_filename_list() ]
+        bckp_filename_list += [ str(summary_path), str(self.model_data_path) ]
+
+        if self.autobackup:
+            current_hour = time.localtime().tm_hour
+            if self.autobackup_current_hour != current_hour:
+                self.autobackup_current_hour = current_hour
+
+                for i in range(15,0,-1):
+                    idx_str = '%.2d' % i
+                    next_idx_str = '%.2d' % (i+1)
+
+                    idx_backup_path = self.autobackups_path / idx_str
+                    next_idx_packup_path = self.autobackups_path / next_idx_str
+
+                    if idx_backup_path.exists():
+                        if i == 15:
+                            Path_utils.delete_all_files(idx_backup_path)
+                        else:
+                            next_idx_packup_path.mkdir(exist_ok=True)
+                            Path_utils.move_all_files (idx_backup_path, next_idx_packup_path)
+
+                    if i == 1:
+                        idx_backup_path.mkdir(exist_ok=True)
+                        for filename in bckp_filename_list:
+                            shutil.copy ( str(filename), str(idx_backup_path / Path(filename).name) )
+
+                        previews = self.get_previews()
+                        plist = []
+                        for i in range(len(previews)):
+                            name, bgr = previews[i]
+                            plist += [ (bgr, idx_backup_path / ( ('preview_%s.jpg') % (name))  )  ]
+
+                        for preview, filepath in plist:
+                            preview_lh = ModelBase.get_loss_history_preview(self.loss_history, self.iter, preview.shape[1], preview.shape[2])
+                            img = (np.concatenate ( [preview_lh, preview], axis=0 ) * 255).astype(np.uint8)
+                            cv2_imwrite (filepath, img )
+
     def load_weights_safe(self, model_filename_list, optimizer_filename_list=[]):
-        for model, filename in model_filename_list:
+        exec(nnlib.code_import_all, locals(), globals())
+        
+        loaded = []
+        not_loaded = []
+        for mf in model_filename_list:
+            model, filename = mf
             filename = self.get_strpath_storage_for_file(filename)
+            
             if Path(filename).exists():
-                model.load_weights(filename)
+                loaded += [ mf ]
+                
+                if issubclass(model.__class__, keras.optimizers.Optimizer):
+                    opt = model
+  
+                    try:
+                        with open(filename, "rb") as f:
+                            fd = pickle.loads(f.read())
+                        
+                        weights = fd.get('weights', None)
+                        if weights is not None:
+                            opt.set_weights(weights)
+                            
+                    except Exception as e:
+                        print ("Unable to load ", filename)
+                        
+                else:
+                    model.load_weights(filename)
+            else:
+                not_loaded += [ mf ]
+                
+                   
+        return loaded, not_loaded
 
-        if len(optimizer_filename_list) != 0:
-            opt_filename = self.get_strpath_storage_for_file('opt.h5')
-            if Path(opt_filename).exists():
-                try:
-                    with open(opt_filename, "rb") as f:
-                        d = pickle.loads(f.read())
-
-                    for x in optimizer_filename_list:
-                        opt, filename = x
-                        if filename in d:
-                            weights = d[filename].get('weights', None)
-                            if weights:
-                                opt.set_weights(weights)
-                                print("set ok")
-                except Exception as e:
-                    print ("Unable to load ", opt_filename)
-
-
-    def save_weights_safe(self, model_filename_list, optimizer_filename_list=[]):
+    def save_weights_safe(self, model_filename_list):
+        exec(nnlib.code_import_all, locals(), globals())
+        
         for model, filename in model_filename_list:
-            filename = self.get_strpath_storage_for_file(filename)
-            model.save_weights( filename + '.tmp' )
+            filename = self.get_strpath_storage_for_file(filename) + '.tmp'
+
+            if issubclass(model.__class__, keras.optimizers.Optimizer):
+                opt = model
+                
+                try:                    
+                    fd = {}
+                    symbolic_weights = getattr(opt, 'weights')
+                    if symbolic_weights:
+                        fd['weights'] = self.K.batch_get_value(symbolic_weights)
+
+                    with open(filename, 'wb') as f:
+                        f.write( pickle.dumps(fd) )
+                except Exception as e:
+                    print ("Unable to save ", filename)                
+            else:                
+                model.save_weights( filename)
 
         rename_list = model_filename_list
+
+        """
+        #unused
+        , optimizer_filename_list=[]
         if len(optimizer_filename_list) != 0:
             opt_filename = self.get_strpath_storage_for_file('opt.h5')
 
@@ -333,6 +492,7 @@ class ModelBase(object):
                 rename_list += [('', 'opt.h5')]
             except Exception as e:
                 print ("Unable to save ", opt_filename)
+        """
 
         for _, filename in rename_list:
             filename = self.get_strpath_storage_for_file(filename)
@@ -343,7 +503,6 @@ class ModelBase(object):
                     target_filename.unlink()
                 source_filename.rename ( str(target_filename) )
 
-
     def debug_one_iter(self):
         images = []
         for generator in self.generator_list:
@@ -351,11 +510,15 @@ class ModelBase(object):
                 if len(batch.shape) == 4:
                     images.append( batch[0] )
 
-        return image_utils.equalize_and_stack_square (images)
+        return imagelib.equalize_and_stack_square (images)
 
     def generate_next_sample(self):
-        return [next(generator) for generator in self.generator_list]
+        return [ generator.generate_next() for generator in self.generator_list]
 
+    #overridable
+    def on_success_train_one_iter(self):
+        pass
+        
     def train_one_iter(self):
         sample = self.generate_next_sample()
         iter_time = time.time()
@@ -365,24 +528,28 @@ class ModelBase(object):
 
         self.loss_history.append ( [float(loss[1]) for loss in losses] )
 
-        if self.write_preview_history:
-            if self.iter % 10 == 0:
-                preview = self.get_static_preview()
+        if self.iter % 10 == 0:
+            plist = []
+
+            if io.is_colab():
+                previews = self.get_previews()
+                for i in range(len(previews)):
+                    name, bgr = previews[i]
+                    plist += [ (bgr, self.get_strpath_storage_for_file('preview_%s.jpg' % (name) ) ) ]
+
+            if self.write_preview_history:
+                plist += [ (self.get_static_preview(), str (self.preview_history_path / ('%.6d.jpg' % (self.iter))) ) ]
+
+            for preview, filepath in plist:
                 preview_lh = ModelBase.get_loss_history_preview(self.loss_history, self.iter, preview.shape[1], preview.shape[2])
                 img = (np.concatenate ( [preview_lh, preview], axis=0 ) * 255).astype(np.uint8)
-                cv2_imwrite ( str (self.preview_history_path / ('%.6d.jpg' %( self.iter) )), img )
+                cv2_imwrite (filepath, img )
 
+        self.on_success_train_one_iter()
+                
         self.iter += 1
 
-        time_str = time.strftime("[%H:%M:%S]")
-        if iter_time >= 10:
-            loss_string = "{0}[#{1:06d}][{2:.5s}s]".format ( time_str, self.iter, '{:0.4f}'.format(iter_time) )
-        else:
-            loss_string = "{0}[#{1:06d}][{2:04d}ms]".format ( time_str, self.iter, int(iter_time*1000) )
-        for (loss_name, loss_value) in losses:
-            loss_string += " %s:%.3f" % (loss_name, loss_value)
-
-        return loss_string
+        return self.iter, iter_time
 
     def pass_one_iter(self):
         self.last_sample = self.generate_next_sample()
@@ -446,45 +613,47 @@ class ModelBase(object):
 
         lh_height = 100
         lh_img = np.ones ( (lh_height,w,c) ) * 0.1
-        loss_count = len(loss_history[0])
-        lh_len = len(loss_history)
 
-        l_per_col = lh_len / w
-        plist_max = [   [   max (0.0, loss_history[int(col*l_per_col)][p],
-                                            *[  loss_history[i_ab][p]
-                                                for i_ab in range( int(col*l_per_col), int((col+1)*l_per_col) )
-                                             ]
-                                )
-                            for p in range(loss_count)
+        if len(loss_history) != 0:
+            loss_count = len(loss_history[0])
+            lh_len = len(loss_history)
+
+            l_per_col = lh_len / w
+            plist_max = [   [   max (0.0, loss_history[int(col*l_per_col)][p],
+                                                *[  loss_history[i_ab][p]
+                                                    for i_ab in range( int(col*l_per_col), int((col+1)*l_per_col) )
+                                                ]
+                                    )
+                                for p in range(loss_count)
+                            ]
+                            for col in range(w)
                         ]
-                        for col in range(w)
-                    ]
 
-        plist_min = [   [   min (plist_max[col][p], loss_history[int(col*l_per_col)][p],
-                                            *[  loss_history[i_ab][p]
-                                                for i_ab in range( int(col*l_per_col), int((col+1)*l_per_col) )
-                                             ]
-                                )
-                            for p in range(loss_count)
+            plist_min = [   [   min (plist_max[col][p], loss_history[int(col*l_per_col)][p],
+                                                *[  loss_history[i_ab][p]
+                                                    for i_ab in range( int(col*l_per_col), int((col+1)*l_per_col) )
+                                                ]
+                                    )
+                                for p in range(loss_count)
+                            ]
+                            for col in range(w)
                         ]
-                        for col in range(w)
-                    ]
 
-        plist_abs_max = np.mean(loss_history[ len(loss_history) // 5 : ]) * 2
+            plist_abs_max = np.mean(loss_history[ len(loss_history) // 5 : ]) * 2
 
-        for col in range(0, w):
-            for p in range(0,loss_count):
-                point_color = [1.0]*c
-                point_color[0:3] = colorsys.hsv_to_rgb ( p * (1.0/loss_count), 1.0, 1.0 )
+            for col in range(0, w):
+                for p in range(0,loss_count):
+                    point_color = [1.0]*c
+                    point_color[0:3] = colorsys.hsv_to_rgb ( p * (1.0/loss_count), 1.0, 1.0 )
 
-                ph_max = int ( (plist_max[col][p] / plist_abs_max) * (lh_height-1) )
-                ph_max = np.clip( ph_max, 0, lh_height-1 )
+                    ph_max = int ( (plist_max[col][p] / plist_abs_max) * (lh_height-1) )
+                    ph_max = np.clip( ph_max, 0, lh_height-1 )
 
-                ph_min = int ( (plist_min[col][p] / plist_abs_max) * (lh_height-1) )
-                ph_min = np.clip( ph_min, 0, lh_height-1 )
+                    ph_min = int ( (plist_min[col][p] / plist_abs_max) * (lh_height-1) )
+                    ph_min = np.clip( ph_min, 0, lh_height-1 )
 
-                for ph in range(ph_min, ph_max+1):
-                    lh_img[ (lh_height-ph-1), col ] = point_color
+                    for ph in range(ph_min, ph_max+1):
+                        lh_img[ (lh_height-ph-1), col ] = point_color
 
         lh_lines = 5
         lh_line_height = (lh_height-1)/lh_lines
@@ -496,5 +665,5 @@ class ModelBase(object):
 
         lh_text = 'Iter: %d' % (iter) if iter != 0 else ''
 
-        lh_img[last_line_t:last_line_b, 0:w] += image_utils.get_text_image (  (w,last_line_b-last_line_t,c), lh_text, color=[0.8]*c )
+        lh_img[last_line_t:last_line_b, 0:w] += imagelib.get_text_image (  (last_line_b-last_line_t,w,c), lh_text, color=[0.8]*c )
         return lh_img

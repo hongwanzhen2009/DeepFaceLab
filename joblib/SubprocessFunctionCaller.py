@@ -8,9 +8,9 @@ class SubprocessFunctionCaller(object):
             self.c2s = c2s
             self.lock = lock
 
-        def __call__(self, value):
+        def __call__(self, *args, **kwargs):
             self.lock.acquire()
-            self.c2s.put (value)
+            self.c2s.put ( {'args':args, 'kwargs':kwargs} )
             while True:
                 if not self.s2c.empty():
                     obj = self.s2c.get()
@@ -27,11 +27,18 @@ class SubprocessFunctionCaller(object):
         def process_messages(self):
             while not self.c2s.empty():
                 obj = self.c2s.get()
-                result = self.func (obj)
+                result = self.func ( *obj['args'], **obj['kwargs'] )
                 self.s2c.put (result)
 
+        def __getstate__(self):
+            #disable pickling this class
+            return dict()
+
+        def __setstate__(self, d):
+            self.__dict__.update(d)
+
     @staticmethod
-    def make_pair( func ):
+    def make_pair(func):
         s2c = multiprocessing.Queue()
         c2s = multiprocessing.Queue()
         lock = multiprocessing.Lock()

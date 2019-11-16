@@ -3,7 +3,7 @@ import numpy as np
 from nnlib import nnlib
 from models import ModelBase
 from facelib import FaceType
-from samples import *
+from samplelib import *
 from interact import interact as io
 
 class Model(ModelBase):
@@ -20,7 +20,7 @@ class Model(ModelBase):
 
         if is_first_run or ask_override:
             def_pixel_loss = self.options.get('pixel_loss', False)
-            self.options['pixel_loss'] = io.input_bool ("Use pixel loss? (y/n, ?:help skip: n/default ) : ", def_pixel_loss, help_message="Default DSSIM loss good for initial understanding structure of faces. Use pixel loss after 20k iters to enhance fine details and decrease face jitter.")
+            self.options['pixel_loss'] = io.input_bool ("Use pixel loss? (y/n, ?:help skip: n/default ) : ", def_pixel_loss, help_message="Pixel loss may help to enhance fine details and stabilize face color. Use it only if quality does not improve over time.")
         else:
             self.options['pixel_loss'] = self.options.get('pixel_loss', False)
 
@@ -54,27 +54,31 @@ class Model(ModelBase):
         self.dst_view = K.function([input_dst_bgr],[rec_dst_bgr, rec_dst_mask])
 
         if self.is_training_mode:
-            f = SampleProcessor.TypeFlags
+            t = SampleProcessor.Types
+            output_sample_types=[ { 'types': (t.IMG_WARPED_TRANSFORMED, t.FACE_TYPE_HALF, t.MODE_BGR), 'resolution':128},
+                                  { 'types': (t.IMG_TRANSFORMED, t.FACE_TYPE_HALF, t.MODE_BGR), 'resolution':128},
+                                  { 'types': (t.IMG_TRANSFORMED, t.FACE_TYPE_HALF, t.MODE_M), 'resolution':128} ]
+
             self.set_training_data_generators ([
                     SampleGeneratorFace(self.training_data_src_path, sort_by_yaw_target_samples_path=self.training_data_dst_path if self.sort_by_yaw else None,
                                                                      debug=self.is_debug(), batch_size=self.batch_size,
                             sample_process_options=SampleProcessor.Options(random_flip=self.random_flip, scale_range=np.array([-0.05, 0.05])+self.src_scale_mod / 100.0 ),
-                            output_sample_types=[ [f.WARPED_TRANSFORMED | f.FACE_ALIGN_HALF | f.MODE_BGR, 128],
-                                                  [f.TRANSFORMED | f.FACE_ALIGN_HALF | f.MODE_BGR, 128],
-                                                  [f.TRANSFORMED | f.FACE_ALIGN_HALF | f.MODE_M | f.FACE_MASK_FULL, 128] ] ),
+                            output_sample_types=output_sample_types ),
 
                     SampleGeneratorFace(self.training_data_dst_path, debug=self.is_debug(), batch_size=self.batch_size,
                             sample_process_options=SampleProcessor.Options(random_flip=self.random_flip),
-                            output_sample_types=[ [f.WARPED_TRANSFORMED | f.FACE_ALIGN_HALF | f.MODE_BGR, 128],
-                                                  [f.TRANSFORMED | f.FACE_ALIGN_HALF | f.MODE_BGR, 128],
-                                                  [f.TRANSFORMED | f.FACE_ALIGN_HALF | f.MODE_M | f.FACE_MASK_FULL, 128] ] )
+                            output_sample_types=output_sample_types )
                 ])
 
     #override
+    def get_model_filename_list(self):
+        return [[self.encoder, 'encoder.h5'],
+                [self.decoder_src, 'decoder_src.h5'],
+                [self.decoder_dst, 'decoder_dst.h5']]
+
+    #override
     def onSave(self):
-        self.save_weights_safe( [[self.encoder,     'encoder.h5'],
-                                 [self.decoder_src, 'decoder_src.h5'],
-                                 [self.decoder_dst, 'decoder_dst.h5']] )
+        self.save_weights_safe( self.get_model_filename_list() )
 
     #override
     def onTrainOneIter(self, sample, generators_list):
@@ -115,24 +119,17 @@ class Model(ModelBase):
 
         return [ ('H128', np.concatenate ( st, axis=0 ) ) ]
 
-    def predictor_func (self, face):
-        face_128_bgr = face[...,0:3]
-        face_128_mask = np.expand_dims(face[...,3],-1)
-
-        x, mx = self.src_view ( [ np.expand_dims(face_128_bgr,0) ] )
-        x, mx = x[0], mx[0]
-
-        return np.concatenate ( (x,mx), -1 )
+    def predictor_func (self, face=None, dummy_predict=False):
+        if dummy_predict:
+            self.src_view ([ np.zeros ( (1, 128, 128, 3), dtype=np.float32 ) ])
+        else:
+            x, mx = self.src_view ( [ face[np.newaxis,...] ] )
+            return x[0], mx[0][...,0]
 
     #override
-    def get_converter(self):
-        from converters import ConverterMasked
-        return ConverterMasked(self.predictor_func,
-                               predictor_input_size=128,
-                               output_size=128,
-                               face_type=FaceType.HALF,
-                               base_erode_mask_modifier=100,
-                               base_blur_mask_modifier=100)
+    def get_ConverterConfig(self):
+        import converters
+        return self.predictor_func, (128,128,3), converters.ConverterConfigMasked(face_type=FaceType.HALF, default_mode='seamless')
 
     def Build(self, lighter_ae):
         exec(nnlib.code_import_all, locals(), globals())
